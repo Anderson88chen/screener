@@ -239,7 +239,9 @@ class PositionManager:
             if exit_price is not None:
                 fee_rate = self.strategy_config.get('TRANSACTION_FEE_PERCENT')
                 closing_fee = exit_price * position['units'] * fee_rate
-                pnl = (exit_price - position['entry_price']) * position['units'] - closing_fee
+                # 開倉費也要扣（同 close_by_signal）：pnl 會覆蓋開倉時記的 −開倉費，漏掉的話權益與下單量會偏高
+                pnl = (exit_price - position['entry_price']) * position['units'] \
+                    - self._opening_fee(position['entry_price'], position['units']) - closing_fee
 
                 self.positions_df.loc[index, 'status'] = 'CLOSED'
                 self.positions_df.loc[index, 'exit_reason'] = exit_reason

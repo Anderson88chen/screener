@@ -2,6 +2,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from services.order_execution_service import OrderExecutionService
 from services.position_manager import PositionManager
@@ -337,3 +338,15 @@ def test_failed_write_keeps_the_previous_positions_file(tmp_path, monkeypatch):
     monkeypatch.setattr(pd.DataFrame, "to_csv", disk_full)
     pm.close_by_signal("AAAUSDT", 2.2, pd.Timestamp("2026-01-02"), "CROSS_10_20")
     assert (tmp_path / "p.csv").read_text() == before and not (tmp_path / "p.csv.tmp").exists()
+
+
+def test_stop_exit_books_both_fees_like_a_signal_exit(tmp_path):
+    """災難止損（update_positions）和訊號出場（close_by_signal）一樣扣開倉與平倉兩次手續費。
+    原本止損用不含開倉費的 pnl 覆蓋開倉時記的 −開倉費，權益與之後的下單量會偏高。"""
+    pm, _ = _pm(tmp_path)                                                              # 費率 0.05%
+    pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.10, 0.20)          # 500 顆，止損 1.6
+    pm.update_positions({"AAAUSDT": pd.Series({"Datetime": pd.Timestamp("2026-01-02"), "High": 2.0, "Low": 1.5,
+                                               "Close": 1.7})})
+    expected = (1.6 - 2.0) * 500 - 2.0 * 500 * 0.0005 - 1.6 * 500 * 0.0005
+    assert pm.positions_df.iloc[-1]["pnl"] == pytest.approx(expected)
+    assert pm.paper_equity() == pytest.approx(10000.0 + expected)

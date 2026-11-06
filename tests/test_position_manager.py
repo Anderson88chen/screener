@@ -107,12 +107,13 @@ def test_open_position_invalid_units(position_manager):
     assert len(position_manager.positions_df) == 0 # No position should be opened
 
 def test_update_position_take_profit_with_fees(position_manager):
-    """Test that a position is closed correctly on take profit, with closing fees."""
+    """Test that a position is closed correctly on take profit, with opening and closing fees."""
     # entry_price = 100, units = 20 (from test_open_new_position_units_and_fees)
     # take_profit = 110
-    # PnL before closing fee = (110 - 100) * 20 = 200
+    # PnL before fees = (110 - 100) * 20 = 200
+    # Opening fee = 100 * 20 * 0.0006 = 1.2 (booked at entry, must stay in the closed PnL)
     # Closing fee = 110 * 20 * 0.0006 = 1.32
-    # Final PnL = 200 - 1.32 = 198.68
+    # Final PnL = 200 - 1.2 - 1.32 = 197.48
     open_signal = {
         'timestamp': pd.Timestamp.now(),
         'entry_price': 100,
@@ -127,15 +128,16 @@ def test_update_position_take_profit_with_fees(position_manager):
     pos = position_manager.positions_df.iloc[0]
     assert pos['status'] == 'CLOSED'
     assert pos['exit_reason'] == 'TAKE_PROFIT'
-    assert pos['pnl'] == pytest.approx(198.68) # Assert PnL with closing fee
+    assert pos['pnl'] == pytest.approx(197.48) # Assert PnL with opening and closing fees
 
 def test_update_position_stop_loss_with_fees(position_manager):
-    """Test that a position is closed correctly on stop loss, with closing fees."""
+    """Test that a position is closed correctly on stop loss, with opening and closing fees."""
     # entry_price = 100, units = 20 (from test_open_new_position_units_and_fees)
     # stop_loss = 95
-    # PnL before closing fee = (95 - 100) * 20 = -100
+    # PnL before fees = (95 - 100) * 20 = -100
+    # Opening fee = 100 * 20 * 0.0006 = 1.2 (booked at entry, must stay in the closed PnL)
     # Closing fee = 95 * 20 * 0.0006 = 1.14
-    # Final PnL = -100 - 1.14 = -101.14
+    # Final PnL = -100 - 1.2 - 1.14 = -102.34
     open_signal = {
         'timestamp': pd.Timestamp.now(),
         'entry_price': 100,
@@ -150,7 +152,7 @@ def test_update_position_stop_loss_with_fees(position_manager):
     pos = position_manager.positions_df.iloc[0]
     assert pos['status'] == 'CLOSED'
     assert pos['exit_reason'] == 'STOP_LOSS'
-    assert pos['pnl'] == pytest.approx(-101.14) # Assert PnL with closing fee
+    assert pos['pnl'] == pytest.approx(-102.34) # Assert PnL with opening and closing fees
 
 def test_update_floating_pnl_with_fees(position_manager):
     """Test that floating PnL is updated correctly for an open position, including initial opening fee."""
