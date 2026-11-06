@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 import pandas as pd
 
@@ -13,15 +14,19 @@ POSITION_COLUMNS = [
     'entry_order_id', 'entry_fill_price',
 ]
 
+SAVE_ALERT_INTERVAL_S = 3600   # 持倉檔一直寫不進去時，每小時再提醒一次
+
 
 class PositionManager:
     def __init__(self, notification_service: NotificationService, strategy_config: dict,
-                 csv_path='data/positions.csv', order_execution_service=None):
+                 csv_path='data/positions.csv', order_execution_service=None, clock=time.monotonic):
         self.csv_path = csv_path
         self.notification_service = notification_service
         self.strategy_config = strategy_config
         self.order_execution_service = order_execution_service
         self._save_failing = False
+        self._save_alerted_at = None
+        self._clock = clock
         self.positions_df = self._load_positions()
 
     def _load_positions(self) -> pd.DataFrame:
@@ -47,25 +52,54 @@ class PositionManager:
         df.to_csv(self.csv_path, index=False)
         return df
 
-    def _save_positions(self):
-        """Saves the current positions DataFrame to the CSV file.
-        寫不進去（例如 Windows 上檔案被 Excel 或防毒鎖住）只記錄、不往外丟：記憶體裡的持倉照常運作、交易所下單照常，
-        下一次存檔會整份重寫。連續失敗只在第一次發 Discord。"""
+    def _save_positions(self) -> bool:
+        """Saves the current positions DataFrame to the CSV file; returns whether it was written.
+        先寫暫存檔再用 os.replace 換上：寫到一半失敗（例如磁碟滿）時舊檔不會被清空。
+        寫不進去（例如 Windows 上檔案被 Excel 或防毒鎖住）只記錄、不往外丟：記憶體裡的持倉照常運作、平倉照常；
+        失敗期間 open_notional 不開新倉（重啟後檔案裡沒有的倉沒人管），每小時再提醒一次，下次存檔會整份重寫。"""
+        tmp = self.csv_path + ".tmp"
         try:
-            self.positions_df.to_csv(self.csv_path, index=False)
+            self.positions_df.to_csv(tmp, index=False)
         except OSError as e:
-            logger.error(f"Could not save positions to {self.csv_path}: {e}")
-            if not self._save_failing:
-                self._save_failing = True
-                try:
-                    self.notification_service.send_heartbeat_notification(
-                        message=f"⚠️ 持倉檔寫不進去（{e}），記憶體中的持倉照常運作，下次存檔會再試")
-                except Exception:
-                    logger.exception("Heartbeat notification failed")
-            return
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            self._save_error(e, kept=None)
+            return False
+        try:
+            os.replace(tmp, self.csv_path)
+        except OSError as e:
+            self._save_error(e, kept=tmp)
+            return False
         if self._save_failing:
             self._save_failing = False
+            self._save_alerted_at = None
             logger.info(f"Positions saved again to {self.csv_path}")
+            self._notify("✅ 持倉檔恢復寫入，恢復開新倉")
+        return True
+
+    def _save_error(self, error, kept):
+        """存檔失敗：記 log；第一次與之後每小時發 Discord。kept = 已寫好最新持倉、但換不上去的暫存檔。"""
+        logger.error(f"Could not save positions to {self.csv_path}: {error}")
+        now = self._clock()
+        due = not self._save_failing or self._save_alerted_at is None or now - self._save_alerted_at >= SAVE_ALERT_INTERVAL_S
+        self._save_failing = True
+        if due:
+            self._save_alerted_at = now
+            where = f"，最新持倉在 {kept}" if kept else ""
+            self._notify(f"⚠️ 持倉檔寫不進去（{error}）{where}。暫停開新倉，平倉照常；每小時重試並提醒，"
+                         f"請關掉鎖住檔案的程式或清出磁碟空間")
+
+    def _notify(self, message):
+        try:
+            self.notification_service.send_heartbeat_notification(message=message)
+        except Exception:
+            logger.exception("Heartbeat notification failed")
+
+    def retry_save_if_failing(self) -> bool:
+        """主迴圈每個整點呼叫：存檔失敗中就再寫一次（成功 → 恢復開新倉；仍失敗 → 依間隔再提醒）。"""
+        return self._save_positions() if self._save_failing else True
 
     def _opening_fee(self, entry_price: float, units: float) -> float:
         """Calculate the transaction fee for opening a position."""
@@ -256,6 +290,9 @@ class PositionManager:
         if max_positions is not None and len(open_symbols) >= max_positions:
             logger.info(f"{len(open_symbols)} positions open (max {max_positions}). Ignoring BUY for {symbol}.")
             return False
+        if self._save_failing and not self._save_positions():
+            logger.warning(f"Positions file not writable; not opening {symbol}")
+            return False
         units = self.sizing_equity() * notional_pct / price
         stop = price * (1 - disaster_stop_pct)
         row = {'symbol': symbol, 'status': 'OPEN', 'entry_price': price, 'stop_loss': stop,
@@ -263,8 +300,12 @@ class PositionManager:
                'exit_timestamp': pd.NaT, 'exit_reason': None, 'pnl': -self._opening_fee(price, units),
                'entry_order_id': None, 'entry_fill_price': float('nan')}
         self.positions_df = pd.concat([self.positions_df, pd.DataFrame([row])], ignore_index=True)
-        self._save_positions()
         idx = self.positions_df.index[-1]
+        if not self._save_positions():
+            # 這筆寫不進檔案就不下單：bot 重啟後檔案裡沒有它，訊號出場與開關全平都管不到這個倉
+            self.positions_df = self.positions_df.drop(index=idx)
+            logger.warning(f"Positions file not writable; not opening {symbol}")
+            return False
         info, orders = {"exchange": "disabled", "order_id": None, "fill_price": None}, None
         if self.order_execution_service:
             entry = None

@@ -356,3 +356,118 @@ def test_enforce_gate_books_stops_before_closing_the_rest(tmp_path):
     assert rows.loc["AAAUSDT", "exit_reason"] == "STOP_LOSS" and rows.loc["BBBUSDT", "exit_reason"] == "GATE_OFF_BREADTH"
     assert live.last_closed_bar.call_args.args[1] == _ms("2026-01-02 05:00:01")
     assert "另有 1 檔" in notif.send_heartbeat_notification.call_args.kwargs["message"]
+
+
+# ---------- PR #3 複查（2026-11-02）：主迴圈各段分開接例外、用 K 棒時間觸發換日與整點檢查 ----------
+
+def _state(clock, cutoff, breadth_hour, retry_at=None):
+    return main.LoopState(clock=pd.Timestamp(clock), cutoff=pd.Timestamp(cutoff),
+                          retry_at=pd.Timestamp(retry_at or clock), breadth_hour=pd.Timestamp(breadth_hour), gate="on")
+
+
+def _record_loop(monkeypatch, order, rollover_result=True):
+    def rollover(live, pm, ws, notif, cutoff, subscribed):
+        order.append(("rollover", cutoff))
+        if isinstance(rollover_result, Exception):
+            raise rollover_result
+        return rollover_result
+
+    monkeypatch.setattr(main, "rollover", rollover)
+    monkeypatch.setattr(main, "hourly_gate", lambda live, pm, notif, now, prev: order.append(("hourly", now)) or "on")
+    monkeypatch.setattr(main, "collect_batch", lambda ws, message, subscribed: ([message], []))
+    monkeypatch.setattr(main, "handle_batch", lambda batch, live, pm, cfg: order.append(("batch", batch[0]["k"]["t"])))
+    monkeypatch.setattr(main, "subscribe_open_positions", lambda ws, pm, subscribed: set())
+
+
+def test_loop_clock_uses_bar_close_then_local_clock_after_grace():
+    msg = _msg("AAAUSDT", _ms("2026-01-01 23:00"))
+    assert main.loop_clock(pd.Timestamp("2026-01-01 23:30"), msg, pd.Timestamp("2026-01-01 23:59:59.7")) == pd.Timestamp("2026-01-02")
+    assert main.loop_clock(pd.Timestamp("2026-01-02"), None, pd.Timestamp("2026-01-02 00:00:30")) == pd.Timestamp("2026-01-02")
+    assert main.loop_clock(pd.Timestamp("2026-01-02"), None, pd.Timestamp("2026-01-02 01:01")) == pd.Timestamp("2026-01-02 01:00")
+    old = _msg("AAAUSDT", _ms("2026-01-01 20:00"))                                   # 晚到的舊 K 棒不會讓時間倒退
+    assert main.loop_clock(pd.Timestamp("2026-01-02"), old, pd.Timestamp("2026-01-02 00:00:05")) == pd.Timestamp("2026-01-02")
+
+
+def test_23h_bar_triggers_rollover_and_gate_before_it_is_handled_even_if_local_clock_is_slow(monkeypatch):
+    """本機時鐘慢：00:00 收完的 23:00 那根在本機 23:59:59.7 到達。要先換日、更新開關，再處理這根。"""
+    order = []
+    _record_loop(monkeypatch, order)
+    st = _state("2026-01-01 23:30", "2026-01-02", "2026-01-01 23:00")
+    msg = _msg("AAAUSDT", _ms("2026-01-01 23:00"))
+    main.loop_step(st, msg, MagicMock(), MagicMock(), MagicMock(), MagicMock(), set(), {}, MagicMock(),
+                   pd.Timestamp("2026-01-01 23:59:59.7"))
+    assert order == [("rollover", pd.Timestamp("2026-01-02")), ("hourly", pd.Timestamp("2026-01-02")),
+                     ("batch", _ms("2026-01-01 23:00"))]
+    assert st.cutoff == pd.Timestamp("2026-01-03") and st.breadth_hour == pd.Timestamp("2026-01-02")
+
+
+def test_without_klines_the_local_clock_triggers_only_after_the_grace_period(monkeypatch):
+    order = []
+    _record_loop(monkeypatch, order)
+    st = _state("2026-01-02 05:30", "2026-01-03", "2026-01-02 05:00")
+    args = (MagicMock(), MagicMock(), MagicMock(), MagicMock(), set(), {}, MagicMock())
+    main.loop_step(st, None, *args, pd.Timestamp("2026-01-02 06:00:30"))              # 本機時鐘快 30 秒也不提前
+    assert order == []
+    main.loop_step(st, None, *args, pd.Timestamp("2026-01-02 06:01:00"))
+    assert order == [("hourly", pd.Timestamp("2026-01-02 06:00"))]
+
+
+def test_loop_step_keeps_handling_klines_when_rollover_raises(monkeypatch):
+    """換日中途拋例外：這一輪取出的 K 棒照樣處理、整點檢查照跑、5 分鐘後才重試換日；Discord 每小時最多一則。"""
+    order = []
+    _record_loop(monkeypatch, order, rollover_result=RuntimeError("RetryError: 429"))
+    notif = MagicMock()
+    alerts = main.AlertThrottle(notif, clock=lambda: pd.Timestamp("2026-01-02 00:00:05"))
+    st = _state("2026-01-01 23:30", "2026-01-02", "2026-01-01 23:00")
+    local = pd.Timestamp("2026-01-02 00:00:05")
+    main.loop_step(st, _msg("AAAUSDT", _ms("2026-01-01 23:00")), MagicMock(), MagicMock(), MagicMock(), notif, set(), {},
+                   alerts, local)
+    assert [o[0] for o in order] == ["rollover", "hourly", "batch"]
+    assert st.cutoff == pd.Timestamp("2026-01-02") and st.retry_at == local + main.REBALANCE_RETRY
+    main.loop_step(st, None, MagicMock(), MagicMock(), MagicMock(), notif, set(), {}, alerts, local + pd.Timedelta(seconds=1))
+    assert [o[0] for o in order] == ["rollover", "hourly", "batch"]                     # 還沒到重試時間
+    main.loop_step(st, None, MagicMock(), MagicMock(), MagicMock(), notif, set(), {}, alerts, st.retry_at)
+    assert [o[0] for o in order][-1] == "rollover"
+    assert notif.send_heartbeat_notification.call_count == 1                             # 同一種錯誤一小時一則
+
+
+def test_loop_step_alerts_once_per_hour_when_kline_handling_fails(monkeypatch):
+    order = []
+    _record_loop(monkeypatch, order)
+    monkeypatch.setattr(main, "handle_batch", MagicMock(side_effect=RuntimeError("boom")))
+    notif, now = MagicMock(), [pd.Timestamp("2026-01-02 05:00:01")]
+    alerts = main.AlertThrottle(notif, clock=lambda: now[0])
+    st = _state("2026-01-02 05:00", "2026-01-03", "2026-01-02 05:00")
+    for hour in ("05:00:01", "05:30:00", "06:00:02"):
+        now[0] = pd.Timestamp(f"2026-01-02 {hour}")
+        bar = pd.Timestamp(f"2026-01-02 {hour}").floor("h") - pd.Timedelta(hours=1)
+        main.loop_step(st, _msg("AAAUSDT", _ms(str(bar))), MagicMock(), MagicMock(), MagicMock(), notif, set(), {}, alerts,
+                       now[0])
+    assert notif.send_heartbeat_notification.call_count == 2
+
+
+def test_loop_step_retries_the_positions_file_every_hour(monkeypatch):
+    order = []
+    _record_loop(monkeypatch, order)
+    pm = MagicMock()
+    st = _state("2026-01-02 05:30", "2026-01-03", "2026-01-02 05:00")
+    main.loop_step(st, _msg("AAAUSDT", _ms("2026-01-02 05:00")), MagicMock(), pm, MagicMock(), MagicMock(), set(), {},
+                   MagicMock(), pd.Timestamp("2026-01-02 06:00:01"))
+    pm.retry_save_if_failing.assert_called_once()
+
+
+def test_rollover_survives_warmup_and_subscribe_errors():
+    """暖機碰到限速（RetryError）不算換日失敗：其餘的幣等下一根 K 棒再補暖機；訂閱出錯才算失敗，5 分鐘後重試。"""
+    live, pm, ws, notif = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    live.daily_rebalance.return_value = (["AAAUSDT", "BBBUSDT", "CCCUSDT"], True)
+    live.states = {}
+    live.warmup.side_effect = [True, RuntimeError("RetryError: 429"), True]
+    pm.get_open_positions_symbols.return_value = []
+    subscribed = set()
+    assert main.rollover(live, pm, ws, notif, pd.Timestamp("2026-01-02"), subscribed) is True
+    assert [c.args[0] for c in live.warmup.call_args_list] == ["AAAUSDT", "BBBUSDT"]
+    assert subscribed == {"AAAUSDT", "BBBUSDT", "CCCUSDT"}
+    ws.subscribe.side_effect = RuntimeError("websocket closed")
+    live.warmup.side_effect = None
+    assert main.rollover(live, pm, ws, notif, pd.Timestamp("2026-01-03"), set()) is False
+    assert "5 分鐘後重試" in notif.send_heartbeat_notification.call_args.kwargs["message"]

@@ -136,7 +136,7 @@ def replay(data_dir, start, end, out_dir, breadth_on, kill, max_positions, notio
     notif = MagicMock()
     pm = PositionManager(notif, {"TOTAL_CAPITAL": capital, "TRANSACTION_FEE_PERCENT": fee},
                          str(Path(tempfile.mkdtemp(prefix="replay_v31_")) / "positions.csv"))
-    pm._save_positions = lambda: None                         # 重播只在記憶體記帳（每筆進出場寫 CSV 在 Windows 會撞檔案鎖）
+    pm._save_positions = lambda: True                         # 重播只在記憶體記帳（每筆進出場寫 CSV 在 Windows 會撞檔案鎖）；回報「已存檔」，否則不會開倉
     live = ShotgunV3Live(fetcher, exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=NON_CRYPTO_BASES,
                          now_ms=lambda: fetcher.now, fetch_workers=1, rs_mode=RS_MODE,
                          min_daily_quote_vol=MIN_DAILY_QUOTE_VOL, breadth_on=breadth_on,

@@ -260,9 +260,11 @@ class ShotgunV3Live:
         if has_position:
             return "SELL" if V.exit_signal(snap.s10, snap.s20) else None
         lst, bull = self.day_info(open_ms)
-        now_ms = self.now_ms()
-        if (symbol in lst and V.gate_on(bull, self.breadth_now(now_ms), self.breadth_on)
-                and not (self.entry_requires_gate_now and self.gate_off_reason(now_ms))
+        close_ms = open_ms + V.HOUR_MS              # 這根的收盤時間（交易所時間）：開關照它判斷，不看本機時鐘
+        # entry_requires_gate_now：收盤這一刻的開關也要確定是 on。23:00 那根收在隔天 00:00，用隔天的 BTC 旗標；
+        # 隔天名單還沒算出來（換日失敗）就是 unknown，不進場。
+        if (symbol in lst and V.gate_on(bull, self.breadth_now(close_ms), self.breadth_on)
+                and (not self.entry_requires_gate_now or self.gate_state(close_ms) == "on")
                 and V.entry_signal(snap.close, snap.s10, snap.s20, snap.s50, snap.s233, snap.er)):
             return "BUY"
         return None

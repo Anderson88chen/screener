@@ -345,3 +345,19 @@ def test_23h_bar_does_not_buy_after_the_gate_closed_at_midnight():
         _breadth_on(live, T0, 0.8)
         assert live.on_closed_kline("AAAUSDT", T0 - H, float(up[-1]), has_position=False) == want
 
+
+
+def test_23h_bar_entry_follows_the_bar_close_not_the_local_clock():
+    """PR #3 複查：本機時鐘慢一點（23:59:59.7 收到 23:00 那根）時，開關仍照 K 棒收盤（00:00）判斷；
+    隔天的旗標還沒算出來（換日失敗）也不進場。原版 v3 preset 照舊用前一天的旗標。"""
+    for today, requires, want in (((frozenset(), False), True, None), (None, True, None), (None, False, "BUY")):
+        f = BreadthFetcher()
+        up = 100 * np.exp(np.cumsum(np.full(1500, 0.001)))
+        f.k1h["AAAUSDT"] = _rows(up[:-1], T0 - 1500 * H, H)
+        live = ShotgunV3Live(f, now_ms=lambda: T0 - 300, entry_requires_gate_now=requires)
+        assert live.warmup("AAAUSDT")
+        live.days[pd.Timestamp(T0 - H, unit="ms").date()] = (frozenset({"AAAUSDT"}), True)
+        if today is not None:
+            live.days[pd.Timestamp(T0, unit="ms").date()] = today
+        _breadth_on(live, T0 - H, 0.8)
+        assert live.on_closed_kline("AAAUSDT", T0 - H, float(up[-1]), has_position=False) == want

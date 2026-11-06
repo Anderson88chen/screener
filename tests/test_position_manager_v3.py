@@ -270,3 +270,70 @@ def test_close_alerts_when_exchange_position_was_already_stopped(tmp_path):
     pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.10, 0.20)
     pm.close_by_signal("AAAUSDT", 1.7, pd.Timestamp("2026-01-02"), "GATE_OFF_BREADTH")
     assert any("交易所端已先平倉" in str(c) for c in notif.send_heartbeat_notification.call_args_list)
+
+
+# ---------- PR #3 複查（2026-11-02）：持倉檔寫不進去時不開新倉、每小時提醒、先寫暫存檔再換上 ----------
+
+def _lock_csv(monkeypatch):
+    """模擬 Windows 上持倉檔被 Excel 鎖住：暫存檔寫得進去，換上去時 PermissionError。"""
+    import os
+
+    def locked(src, dst):
+        raise PermissionError(f"{dst} is locked")
+
+    monkeypatch.setattr(os, "replace", locked)
+
+
+def test_open_refused_while_positions_file_is_locked(tmp_path, monkeypatch):
+    """寫不進去的這段期間不能開新倉（重啟後檔案裡沒有它，出場和全平都管不到）；平倉照常；解鎖後恢復。"""
+    oes = MagicMock()
+    pm, notif = _pm(tmp_path, oes)
+    ts = pd.Timestamp("2026-01-01")
+    assert pm.open_notional("AAAUSDT", 2.0, ts, 0.10, 0.20)
+    with monkeypatch.context() as m:
+        _lock_csv(m)
+        assert pm.open_notional("BBBUSDT", 1.0, ts, 0.10, 0.20) is False       # 這筆自己的存檔就失敗 → 不下單
+        assert pm.open_notional("CCCUSDT", 1.0, ts, 0.10, 0.20) is False       # 已在失敗中 → 先重試，仍失敗 → 不下單
+        assert oes.place_market_order.call_count == 1
+        assert pm.get_open_positions_symbols() == ["AAAUSDT"]
+        assert pm.close_by_signal("AAAUSDT", 2.2, pd.Timestamp("2026-01-02"), "CROSS_10_20")   # 平倉照常
+        assert oes.close_position.call_count == 1
+        assert "AAAUSDT,CLOSED" in (tmp_path / "p.csv.tmp").read_text()        # 最新持倉留在暫存檔
+        alerts = [str(c) for c in notif.send_heartbeat_notification.call_args_list if "寫不進去" in str(c)]
+        assert len(alerts) == 1 and "暫停開新倉" in alerts[0]
+    assert pm.retry_save_if_failing() is True                                  # 解鎖後整點重試 → 寫回、恢復開新倉
+    assert "恢復" in notif.send_heartbeat_notification.call_args.kwargs["message"]
+    assert pd.read_csv(tmp_path / "p.csv")["status"].tolist() == ["CLOSED"]
+    assert pm.open_notional("BBBUSDT", 1.0, ts, 0.10, 0.20)
+    assert oes.place_market_order.call_count == 2
+
+
+def test_locked_positions_file_alerts_again_every_hour(tmp_path, monkeypatch):
+    now = [0.0]
+    notif = MagicMock()
+    pm = PositionManager(notif, {"TOTAL_CAPITAL": 10000.0, "TRANSACTION_FEE_PERCENT": 0.0005},
+                         str(tmp_path / "p.csv"), clock=lambda: now[0])
+    pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.10, 0.20)
+    _lock_csv(monkeypatch)
+    count = lambda: len([c for c in notif.send_heartbeat_notification.call_args_list if "寫不進去" in str(c)])  # noqa: E731
+    pm.close_by_signal("AAAUSDT", 2.2, pd.Timestamp("2026-01-02"), "CROSS_10_20")
+    assert count() == 1
+    now[0] = 1800.0
+    assert pm.retry_save_if_failing() is False and count() == 1
+    now[0] = 3600.0
+    assert pm.retry_save_if_failing() is False and count() == 2
+
+
+def test_failed_write_keeps_the_previous_positions_file(tmp_path, monkeypatch):
+    """磁碟滿時 to_csv 會先清空檔案再失敗；先寫暫存檔，舊檔就還在，重啟後持倉不會全部遺失。"""
+    pm, _ = _pm(tmp_path)
+    pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.10, 0.20)
+    before = (tmp_path / "p.csv").read_text()
+
+    def disk_full(self, path, *a, **k):
+        open(path, "w").write("symbol,sta")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", disk_full)
+    pm.close_by_signal("AAAUSDT", 2.2, pd.Timestamp("2026-01-02"), "CROSS_10_20")
+    assert (tmp_path / "p.csv").read_text() == before and not (tmp_path / "p.csv.tmp").exists()

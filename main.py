@@ -323,34 +323,134 @@ REBALANCE_RETRY = pd.Timedelta(minutes=5)
 
 def rollover(live, position_manager, ws, notification_service, cutoff, subscribed):
     """換日：算 cutoff 當日的名單與開關。失敗 → 警示並回傳 False（呼叫端不推進 cutoff，5 分鐘後重試；
-    期間當日名單為空 → 不進新倉，但持倉的出場照常）。成功 → 暖機「名單 ∪ 持倉」中沒有狀態的幣、訂閱新幣。"""
+    期間當日名單為空 → 不進新倉，但持倉的出場照常）。成功 → 暖機「名單 ∪ 持倉」中沒有狀態的幣、訂閱新幣。
+    不會往外丟例外。暖機出錯（例如限速重試用完）不算換日失敗：剩下的幣也先不暖機，
+    收到它們下一根 K 棒時 on_closed_kline 會自己從 REST 補暖機。"""
     try:
         top, bull = live.daily_rebalance(cutoff)
     except Exception as e:
         logging.error(f"Daily rebalance {cutoff.date()} failed: {e}", exc_info=True)
-        notification_service.send_heartbeat_notification(
-            message=f"⚠️ {cutoff.date()} 名單計算失敗，5 分鐘後重試：{e}")
+        _alert(notification_service, f"⚠️ {cutoff.date()} 名單計算失敗，5 分鐘後重試：{e}")
         return False
-    active = set(top) | set(position_manager.get_open_positions_symbols())
-    for s in active - set(live.states):
-        live.warmup(s)
-    new = set(top) - subscribed
-    if new:
-        ws.subscribe(sorted(new))
-        subscribed |= new
-    stale = subscribed - active
-    if stale:
-        if hasattr(ws, "unsubscribe"):
-            ws.unsubscribe(sorted(stale))
-        subscribed -= stale
-        if isinstance(live.states, dict):
-            for s in stale:
-                live.states.pop(s, None)
-    notification_service.send_list_change_notification(added=set(top), removed=stale, webhook_type="general_targets")
+    try:
+        active = set(top) | set(position_manager.get_open_positions_symbols())
+        pending = sorted(active - set(live.states))
+        for i, s in enumerate(pending):
+            try:
+                live.warmup(s)
+            except Exception as e:
+                logging.warning(f"Warmup failed at rollover for {s} ({e}); "
+                                f"{len(pending) - i} symbols will warm up from their next closed bar: {pending[i:]}")
+                break
+        new = set(top) - subscribed
+        if new:
+            ws.subscribe(sorted(new))
+            subscribed |= new
+        stale = subscribed - active
+        if stale:
+            if hasattr(ws, "unsubscribe"):
+                ws.unsubscribe(sorted(stale))
+            subscribed -= stale
+            if isinstance(live.states, dict):
+                for s in stale:
+                    live.states.pop(s, None)
+    except Exception as e:
+        logging.error(f"Rollover {cutoff.date()} failed after the rebalance: {e}", exc_info=True)
+        _alert(notification_service, f"⚠️ {cutoff.date()} 換日訂閱出錯，5 分鐘後重試：{e}")
+        return False
+    try:
+        notification_service.send_list_change_notification(added=set(top), removed=stale, webhook_type="general_targets")
+    except Exception:
+        logging.exception("List change notification failed")
     logging.info(f"Daily rebalance {cutoff.date()} bull={bull} list={top}")
     rows_4h, universe = dict(live.rows_4h), list(live.universe)
     _start_shadow(lambda: _shadow_job(live, cutoff, list(top), rows_4h, universe))
     return True
+
+
+# ---------- 主迴圈（拆成 loop_step 一輪一輪跑，方便測試） ----------
+
+CLOCK_FALLBACK = pd.Timedelta(seconds=60)    # 收不到 K 棒時，本機時鐘要過整點這麼久才自己觸發換日／整點檢查
+LOOP_ALERT_INTERVAL = pd.Timedelta(hours=1)  # 主迴圈同一種錯誤的 Discord 警示間隔
+
+
+def utc_now():
+    return pd.Timestamp.now(tz="UTC").tz_localize(None)
+
+
+def bar_close(message):
+    """收完的 1h K 棒的收盤時間（交易所時間）。"""
+    return pd.Timestamp(int(message['k']['t']), unit='ms') + pd.Timedelta(hours=1)
+
+
+def loop_clock(previous, message, local_now):
+    """主迴圈的時間：收到收完的 K 棒就用它的收盤時間，23:00 那根一到就先換日、更新開關，不受本機時鐘快慢影響；
+    沒有 K 棒時才用本機時鐘，而且過整點 CLOCK_FALLBACK 後才算（本機時鐘快幾秒也不會在 K 棒收完前觸發）。只往前走。"""
+    t = bar_close(message) if message else local_now - CLOCK_FALLBACK
+    return t if previous is None or t > previous else previous
+
+
+class AlertThrottle:
+    """主迴圈的錯誤：log 每次都記；同一種錯誤的 Discord 警示每 interval 最多一則。"""
+
+    def __init__(self, notification_service, interval=LOOP_ALERT_INTERVAL, clock=utc_now):
+        self.notification_service, self.interval, self.clock = notification_service, interval, clock
+        self.last = {}
+
+    def __call__(self, key, message):
+        now = self.clock()
+        if key in self.last and now - self.last[key] < self.interval:
+            return False
+        self.last[key] = now
+        _alert(self.notification_service, message)
+        return True
+
+
+class LoopState:
+    """主迴圈跨輪記住的狀態。clock：主迴圈時間（見 loop_clock）；cutoff：下一次換日；
+    retry_at：換日失敗後，本機時間到這之後才重試；breadth_hour：最近一次整點檢查；gate：目前開關狀態。"""
+
+    def __init__(self, clock, cutoff, retry_at, breadth_hour, gate):
+        self.clock, self.cutoff, self.retry_at, self.breadth_hour, self.gate = clock, cutoff, retry_at, breadth_hour, gate
+
+
+def loop_step(st, message, live, position_manager, ws, notification_service, subscribed, cfg, alerts, local_now):
+    """主迴圈的一輪：先換日、再整點檢查（寬度、開關、全平、重試存檔），最後處理 K 棒。
+    三段各自接例外，任一段出錯其他段照跑；這一輪取出的 K 棒一定會處理。錯誤記 log、Discord 每小時最多一則。"""
+    st.clock = loop_clock(st.clock, message, local_now)
+    if st.clock >= st.cutoff and local_now >= st.retry_at:
+        try:
+            ok = rollover(live, position_manager, ws, notification_service, st.cutoff, subscribed)
+        except Exception as e:                                  # rollover 自己會接；這裡只是保險
+            logging.error(f"Rollover {st.cutoff.date()} raised: {e}", exc_info=True)
+            alerts("rollover", f"⚠️ {st.cutoff.date()} 換日出錯，5 分鐘後重試：{e}")
+            ok = False
+        if ok:
+            st.cutoff = next_cutoff(st.clock)
+        else:
+            st.retry_at = local_now + REBALANCE_RETRY
+    if st.clock.floor("h") > st.breadth_hour:                   # 先更新寬度與開關，再處理這個整點收完的 K 棒
+        try:
+            st.gate = hourly_gate(live, position_manager, notification_service, st.clock, st.gate)
+        except Exception as e:
+            logging.error(f"Hourly gate at {st.clock} raised: {e}", exc_info=True)
+            alerts("hourly", f"⚠️ 整點開關檢查出錯，下個整點再試：{e}")
+        try:
+            position_manager.retry_save_if_failing()
+        except Exception as e:
+            logging.error(f"Retrying the positions file failed: {e}", exc_info=True)
+        st.breadth_hour = st.clock.floor("h")
+    if message:
+        try:
+            batch, others = collect_batch(ws, message, subscribed)
+            handle_batch(batch, live, position_manager, cfg)
+            if others:
+                handle_batch(others, live, position_manager, cfg)
+            subscribe_open_positions(ws, position_manager, subscribed)
+        except Exception as e:
+            logging.error(f"Kline handling failed: {e}", exc_info=True)
+            alerts("klines", f"⚠️ 處理 K 棒出錯（bot 仍在執行，下一根照常處理）：{e}")
+    return st
 
 
 def run_app(args):
@@ -371,12 +471,12 @@ def run_app(args):
     live = ShotgunV3Live(CryptoFetcher(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=NON_CRYPTO_BASES,
                          shadow_fetcher=CryptoFetcher(), rs_mode=RS_MODE, min_daily_quote_vol=MIN_DAILY_QUOTE_VOL,
                          breadth_on=BREADTH_ON, breadth_min_daily_qv=BREADTH_MIN_DAILY_QV)
-    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    now = utc_now()
     subscribed, ok = bootstrap(live, position_manager, now)
     cutoff = next_cutoff(now) if ok else now.normalize()      # 今日名單沒算成 → 進迴圈後立刻重試
-    retry_at = now
     gate = hourly_gate(live, position_manager, notification_service, now, previous=None)
-    breadth_hour = now.floor("h")
+    st = LoopState(clock=now, cutoff=cutoff, retry_at=now, breadth_hour=now.floor("h"), gate=gate)
+    alerts = AlertThrottle(notification_service)
     notification_service.send_list_change_notification(added=set(subscribed), removed=set(), webhook_type="general_targets")
     ws = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET, notification_service=notification_service)
     ws.start(symbols=sorted(subscribed), interval='1h')
@@ -384,23 +484,11 @@ def run_app(args):
         while True:
             try:
                 message = ws.get_message(block=True, timeout=1)
-                now = pd.Timestamp.now(tz="UTC").tz_localize(None)
-                if now >= cutoff and now >= retry_at:
-                    if rollover(live, position_manager, ws, notification_service, cutoff, subscribed):
-                        cutoff = next_cutoff(now)
-                    else:
-                        retry_at = now + REBALANCE_RETRY
-                if now.floor("h") > breadth_hour:              # 先更新寬度與開關，再處理這個整點收完的 K 棒
-                    gate = hourly_gate(live, position_manager, notification_service, now, gate)
-                    breadth_hour = now.floor("h")
-                if message:
-                    batch, others = collect_batch(ws, message, subscribed)
-                    handle_batch(batch, live, position_manager, cfg)
-                    if others:
-                        handle_batch(others, live, position_manager, cfg)
-                    subscribe_open_positions(ws, position_manager, subscribed)
+                loop_step(st, message, live, position_manager, ws, notification_service, subscribed, cfg, alerts,
+                          utc_now())
             except Exception as e:                             # 任何沒預料到的錯都不能讓 bot 退出（持倉會沒人監控）
                 logging.error(f"Main loop error: {e}", exc_info=True)
+                alerts("loop", f"⚠️ 主迴圈出錯（bot 仍在執行）：{e}")
                 time.sleep(1)
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received.")
